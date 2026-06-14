@@ -1,0 +1,116 @@
+name: Build ImmortalWrt - CMCC XR30 (NAND)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: '编译失败时开启 SSH 调试(tmate)'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: openwrt-24.10
+  CONFIG_FILE: xr30-nand.config
+  DEVICE_GLOB: '*cmcc_rax3000m*'
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - name: 检出本仓库 (获取配置文件)
+        uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        run: |
+          docker image prune -a -f 2>/dev/null || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo -E apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell* mono* mongodb* moby* 2>/dev/null || true
+          sudo -E apt-get -y autoremove --purge
+          sudo -E apt-get clean
+          df -h
+
+      - name: 初始化编译环境
+        run: |
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install -y \
+            ack antlr3 gawk aria2 asciidoc binutils bzip2 lzop checkpolicy cmake cpio curl \
+            device-tree-compiler ecj fastjar flex gettext gcc-multilib g++-multilib git \
+            gperf haveged help2man intltool libelf-dev libglib2.0-dev libgmp3-dev \
+            libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libncursesw5-dev \
+            libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp ninja-build p7zip \
+            p7zip-full patch pkgconf python3 python3-pip python3-ply python3-docutils \
+            python3-pyelftools qemu-utils rsync scons squashfs-tools subversion swig \
+            texinfo uglifyjs upx-ucl vim wget xmlto xxd zlib1g-dev zstd
+          sudo timedatectl set-timezone "$TZ"
+
+      - name: 克隆 ImmortalWrt 官方源码 (openwrt-24.10)
+        run: |
+          df -h
+          git clone $REPO_URL -b $REPO_BRANCH --single-branch --depth=1 immortalwrt
+
+      - name: 缓存软件源码下载目录 (dl)
+        uses: actions/cache@v4
+        with:
+          path: immortalwrt/dl
+          key: xr30-dl-${{ hashFiles('xr30-nand.config') }}
+          restore-keys: |
+            xr30-dl-
+
+      - name: 更新并安装 feeds
+        run: |
+          cd immortalwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 载入自定义配置 (cmcc_rax3000m / XR30-NAND兼容)
+        run: |
+          cp $GITHUB_WORKSPACE/$CONFIG_FILE immortalwrt/.config
+          cd immortalwrt
+          make defconfig
+
+      - name: 下载软件包
+        run: |
+          cd immortalwrt
+          make download -j8
+          find dl -size -1024c -exec rm -f {} \;
+
+      - name: 编译固件
+        run: |
+          cd immortalwrt
+          echo "$(nproc) thread compile"
+          make -j$(nproc) || make -j1 V=s
+
+      - name: SSH 调试 (仅在失败且手动启用时)
+        uses: mxschmitt/action-tmate@v3
+        if: ${{ failure() && inputs.ssh == true }}
+        timeout-minutes: 30
+
+      - name: 整理固件产物
+        run: |
+          mkdir -p firmware
+          cd immortalwrt/bin/targets/mediatek/filogic
+          cp -f ${{ env.DEVICE_GLOB }} "$GITHUB_WORKSPACE/firmware/" 2>/dev/null || true
+          cp -f config.buildinfo profiles.json sha256sums "$GITHUB_WORKSPACE/firmware/" 2>/dev/null || true
+          ls -lh "$GITHUB_WORKSPACE/firmware/"
+
+      - name: 上传固件 (Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-cmcc-xr30-nand-${{ github.run_number }}
+          path: firmware/
+          retention-days: 14
+
+      - name: 发布到 Release
+        uses: softprops/action-gh-release@v2
+        if: ${{ !cancelled() }}
+        with:
+          tag_name: xr30-nand-${{ github.run_number }}
+          name: CMCC XR30 (NAND) - Build #${{ github.run_number }}
+          files: firmware/*
